@@ -21,6 +21,11 @@
 //            bit4 frame event: the picture of a new frame starts now (end of
 //                 vertical blanking) with this eye; 0 = a write event
 //
+//  Settings word: the 64-byte block just below the ring (byte address 0x3DFFEFC0) holds one 64-bit word
+//  [63:56] 0x5E  [55:48] version 1  [47:40] sync adjust index (OSD Sync adjust: 0..20 = 0 .. +1.00 ms, 21..40 = -1.00 .. -0.05 ms,
+//  steps of 50 us)  [39:0] 0.  It is rewritten whenever the setting changes and about every 0.6 s, while 3-D output is enabled.
+//  The emitter shifts the shutter windows by that amount.
+//
 //  Events: every game write (the instant the real adapter would flip the
 //  shutters), every frame start while a 3-D game is running (exact video
 //  timing, for emitters that lock to the display), activity timing out, and an
@@ -35,6 +40,7 @@ module glasses3d #(parameter IDLE_FRAMES = 30)
 	input         swap,          // OSD: exchange the eyes
 	input         pal,
 	input         fast,         // clk_sys runs at the +2.2% glasses sync clock
+	input   [5:0] sync_adj,     // OSD sync adjust index (see above)
 	input         wr,            // one clk_sys pulse after each $FFF8-$FFFB write
 	input         eye,           // bit 0 of the last write: 1 = left open, 0 = right open
 	input         vblank,
@@ -48,6 +54,7 @@ module glasses3d #(parameter IDLE_FRAMES = 30)
 );
 
 localparam [28:0] BASE = 29'h07BFFE00;   // byte address 0x3DFFF000
+localparam [28:0] BASE_SET = BASE - 29'd8; // byte address 0x3DFFEFC0: settings word
 
 // ---------------------------------------------------------------------------
 //  Activity: a 3-D game writes the register every frame; if nothing has been
@@ -132,8 +139,14 @@ reg [63:0] din = 0;
 reg [28:0] addr = BASE;
 reg        we = 0;
 
+reg  [5:0] adj_sent = 6'h3F;                       // 63 is not a valid setting: forces the first write
+reg [24:0] set_timer = 0;
+wire       set_due = enable && ((sync_adj != adj_sent) || set_timer[24]);
+
 always @(posedge clk_sys) begin
 	pop <= 0;
+	set_timer <= set_timer + 1'd1;
+	if (~enable) adj_sent <= 6'h3F;
 
 	if (we) begin
 		if (!DDRAM_BUSY) we <= 0;                   // accepted
@@ -142,6 +155,12 @@ always @(posedge clk_sys) begin
 		addr <= BASE + {20'd0, f_head[45:40], 3'b000};
 		we   <= 1;
 		pop  <= 1;
+	end else if (set_due && ddr_ok) begin           // events first; the settings word when the queue is empty
+		din       <= {8'h5E, 8'h01, 2'b00, sync_adj, 40'd0};
+		addr      <= BASE_SET;
+		we        <= 1;
+		adj_sent  <= sync_adj;
+		set_timer <= 0;
 	end
 end
 

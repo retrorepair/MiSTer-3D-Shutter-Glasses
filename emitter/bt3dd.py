@@ -30,6 +30,16 @@ import struct
 import sys
 import time
 
+_print = print
+
+
+def print(*args, **kwargs):
+    """A full or unwritable log (the MiSTer's /tmp is a small tmpfs) must never take the emitter down with it."""
+    try:
+        _print(*args, **kwargs)
+    except OSError:
+        pass
+
 HCI_COMMAND, HCI_EVENT = 1, 4
 EV_CMD_COMPLETE, EV_CMD_STATUS = 0x0E, 0x0F
 EV_SYNC_TRAIN_COMPLETE, EV_PAGE_TIMEOUT, EV_INQ_RESP_NOTIF = 0x4F, 0x54, 0x56

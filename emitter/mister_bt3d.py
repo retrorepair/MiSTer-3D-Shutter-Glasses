@@ -27,7 +27,7 @@ import time
 from types import SimpleNamespace
 
 import bt3dd
-from bt3dd import op, ok, open_hci, read_clock, beacon_payload, EV_NAMES
+from bt3dd import op, ok, open_hci, read_clock, beacon_payload, EV_NAMES, print
 from bt3d_timing import ClockMap, EventClock, frame_fit, beacon_fields, TICK_US
 
 PHYS_ADDR = 0x3DFFF000
@@ -79,7 +79,7 @@ def bring_up(h, cfg):
     ok('Start_Synchronization_Train', st)
 
 
-CTL_NUM = ('pann', 'centre', 'lead', 'tail', 'shift', 'div', 'bint', 'slew', 'dead', 'sold', 'clkscale', 'soff', 'slag')
+CTL_NUM = ('pann', 'centre', 'lead', 'tail', 'shift', 'div', 'bint', 'slew', 'dead', 'sold', 'clkscale', 'soff', 'slag', 'window', 'guard', 'adj')
 CTL_BOOL = ('swap', 'grid', 'tstatic')
 
 
@@ -109,6 +109,10 @@ class GridLock:
         self.err = 0.0
         self.settled = False
         self.t_refresh = 0.0
+        self.cands = []
+        self.swap = False
+        self.epoch = 0
+        self.far = 0
 
     def _ref(self, cm, now, period):
         """The latest grid instant (Bluetooth ticks) at or before now."""
@@ -117,15 +121,31 @@ class GridLock:
         n = int((((now_ticks - self.origin + wrap / 2) % wrap) - wrap / 2) // period)      # may be -1 right after a slew
         return (self.origin + n * period) % wrap
 
-    def apply(self, fields, cm, now, slew_us, dead_us, settled=True):
+    def apply(self, fields, cm, now, slew_us, dead_us, settled=True, epoch=0):
         clk, phase, lo, lc, ro, rc, p_int, frac = fields
         wrap = float(1 << 28)
         target = clk + phase / TICK_US
-        # The period is only re-read once the crystal-ratio estimate has settled, then every two minutes.  The grid is
+        # The period is only re-read once the estimate has settled, then every two minutes, and only a small, plausible
+        # change is accepted: a few frames after a dropout can give a period that is 100 ppm out, and the glasses then
+        # drift by a whole frame in two minutes.  A larger change needs three refreshes in a row that agree.  The grid is
         # kept where it is while the period is replaced, so the announced sync instants do not jump.
         if self.frozen is None or (settled and not self.settled) or (settled and now - self.t_refresh > 120.0):
+            cand = p_int + frac / 256.0
             if self.frozen is not None and self.origin is not None:
-                self.origin = self._ref(cm, now, (self.frozen[4] + self.frozen[5] / 256.0) / TICK_US)
+                cur = self.frozen[4] + self.frozen[5] / 256.0
+                if abs(cand / cur - 1.0) > 30e-6:
+                    self.cands.append(cand)
+                    self.cands = self.cands[-3:]
+                    if len(self.cands) == 3 and max(self.cands) - min(self.cands) < 10e-6 * cur:
+                        cand = sum(self.cands) / 3.0                    # a real change: take it
+                    else:
+                        cand = cur                                      # an outlier: keep the old period
+                else:
+                    self.cands = []
+                    cand = cur + 0.5 * (cand - cur)                     # small change: move half way
+                self.origin = self._ref(cm, now, cur / TICK_US)
+            p_int = int(cand)
+            frac = int((cand - p_int) * 256)
             self.frozen = (lo, lc, ro, rc, p_int, frac)
             self.settled = settled
             self.t_refresh = now
@@ -134,10 +154,27 @@ class GridLock:
         if self.origin is None:
             self.origin = target
         else:
-            e = ((target - self.origin + wrap / 2) % wrap) - wrap / 2
-            e = e % period
-            if e > period / 2:
+            half = period / 2.0
+            e0 = ((target - self.origin + wrap / 2) % wrap) - wrap / 2
+            e0 = e0 % period
+            if e0 > half:
+                e0 -= period
+            # While the eyes are exchanged the left frames sit half a pair period after the grid.
+            e = (e0 - (half if self.swap else 0.0)) % period
+            if e > half:
                 e -= period
+            if abs(e) > period / 4:             # nowhere near the grid: the left frames moved to the other half of the pair
+                self.far += 1
+                if self.far >= 3 or epoch != self.epoch:
+                    self.swap = not self.swap
+                    self.far = 0
+                    self.err = 0.0
+                    e = (e0 - (half if self.swap else 0.0)) % period
+                    if e > half:
+                        e -= period
+            else:
+                self.far = 0
+            self.epoch = epoch
             self.err += 0.03 * (e * TICK_US - self.err)          # average out the estimation noise (about 4 s)
             if abs(self.err) > dead_us:
                 step = max(-slew_us, min(slew_us, self.err))
@@ -145,6 +182,8 @@ class GridLock:
                 self.err -= step
         ref = self._ref(cm, now, period)
         c = int(ref)
+        if self.swap:
+            lo, lc, ro, rc = ro, rc, lo, lc         # the game's eye order moved by one frame: exchange the lenses
         return c & 0x0FFFFFFF, min(312, int(round((ref - c) * TICK_US))), lo, lc, ro, rc, p_int, frac
 
 
@@ -165,6 +204,34 @@ def restamp(fields, ctl, now, t_start):
     t %= float(1 << 28)
     c = int(t)
     return (c & 0x0FFFFFFF, min(312, int(round((t - c) * TICK_US)))) + tuple(fields[2:])
+
+
+def apply_adj(fields, adj_us):
+    """Shift both lens windows (all four offsets) by adj_us, as far as they stay inside the announced period.  The glasses follow
+    changed offsets immediately, unlike a moved sync instant, so this is what the OSD sync adjust drives."""
+    if not adj_us:
+        return fields
+    clk, phase, lo, lc, ro, rc, p_int, frac = fields
+    offs = (lo, lc, ro, rc)
+    adj = int(round(max(100 - min(offs), min((p_int - 300) - max(offs), adj_us))))
+    return (clk, phase, lo + adj, lc + adj, ro + adj, rc + adj, p_int, frac)
+
+
+SET_PHYS = 0x3DFFE000                    # page holding the core's settings word at +0xFC0 (see rtl/glasses3d.sv)
+SET_OFFSET = 0xFC0
+
+
+def open_settings():
+    fd = os.open('/dev/mem', os.O_RDONLY | os.O_SYNC)
+    return mmap.mmap(fd, 4096, mmap.MAP_SHARED, mmap.PROT_READ, offset=SET_PHYS)
+
+
+def read_sync_adjust(m):
+    """The OSD sync adjust in 50 us steps (None if the core is not publishing it): index 0..20 = 0..+20, 21..40 = -20..-1."""
+    b = m[SET_OFFSET:SET_OFFSET + 8]
+    if len(b) < 8 or b[7] != 0x5E or b[6] != 1 or b[5] > 40:
+        return None
+    return b[5] if b[5] <= 20 else b[5] - 41
 
 
 def find_controller(dev_arg):
@@ -196,8 +263,8 @@ def reconnect(dev_arg, old):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dev', default=None, help='ESP32 bridge port (/dev/ttyUSB0) or hci number; default: first /dev/ttyUSB*, else 0')
-    ap.add_argument('--lead-us', dest='lead_us', type=float, default=1500.0, help='each lens opens this long before its picture starts')
-    ap.add_argument('--tail-us', dest='tail_us', type=float, default=2700.0, help='each lens starts closing this long before the next picture (tail - lead = dark gap between the eyes)')
+    ap.add_argument('--lead-us', dest='lead_us', type=float, default=900.0, help='each lens opens this long before its picture starts')
+    ap.add_argument('--tail-us', dest='tail_us', type=float, default=2700.0, help='only with window=0 in the settings file: each lens starts closing this long before the next picture')
     ap.add_argument('--shift-us', dest='shift_us', type=float, default=0.0)
     ap.add_argument('--swap', action='store_true')
     ap.add_argument('--half-period', dest='half_period', action='store_true', help='experiment: announce one video frame as the glasses period')
@@ -233,6 +300,9 @@ def main():
     else:
         raise SystemExit('the controller does not start')
     ring = open_ring()
+    settings = open_settings()
+    osd_adj = 0                                 # steps of 50 us from OSD > 3D Glasses > Sync adjust
+    next_settings = 0.0
 
     seen = read_ring(ring)                      # ignore what a previous run left behind
     ev = EventClock()
@@ -252,7 +322,7 @@ def main():
     last_inq_print = 0.0
     ctl = dict(pann=0.0, centre=0.0, lead=args.lead_us, tail=args.tail_us, shift=args.shift_us, swap=args.swap,
                div=2.0 if args.half_period else 1.0, bint=args.beacon_ms, slew=5.0, dead=300.0, grid=True, static='',
-               sold=0.0, clkscale=1.0, soff=0.0, slag=0.5, tstatic=False)
+               sold=0.0, clkscale=1.0, soff=0.0, slag=0.5, tstatic=False, window=13900.0, guard=1100.0, adj=0.0)
     ctl_mtime = None
     next_ctl = 0.0
     glock = GridLock()
@@ -293,6 +363,13 @@ def main():
                             print('%7.1f s  settings: %s' % (now - t_start, ' '.join('%s=%s' % kv for kv in sorted(ctl.items()))), flush=True)
                     except (OSError, KeyError):
                         pass
+
+                if now >= next_settings:
+                    next_settings = now + 0.1
+                    got = read_sync_adjust(settings)
+                    if got is not None and got != osd_adj:
+                        osd_adj = got
+                        print('%7.1f s  sync adjust %+.2f ms (OSD)' % (now - t_start, 0.05 * got), flush=True)
 
                 # 1. new game events from the DDR3 ring
                 cur = read_ring(ring)
@@ -355,7 +432,7 @@ def main():
                         if running and cm.fit:
                             fit = frame_fit(ev.left_frame_starts())
                             if fit:
-                                per_s = fit[1] * ev.host_per_fpga
+                                per_s = (ev.pair_seconds or fit[1]) * ev.host_per_fpga
                                 p_true_us = per_s * cm.rate * TICK_US / ctl['div']
                                 pann = ctl['pann'] or (32700.0 if p_true_us > 32700.0 else 0.0)
                                 if pann and not ctl['pann'] and not warned_period:
@@ -363,11 +440,13 @@ def main():
                                     print('%7.1f s  WARNING: the game\'s frame pair lasts %.0f us but the glasses accept at most about 32700 us: '
                                           'turn on OSD > 3D Glasses > Glasses sync clock +2.2%%, or the picture will roll' % (now - t_start, p_true_us), flush=True)
                                 fields = beacon_fields(fit[0], per_s, cm, ctl['lead'], ctl['tail'], ctl['shift'], ctl['swap'],
-                                                       div=int(ctl['div']), pann_us=pann, centre=ctl['centre'])
+                                                       guard_us=ctl['guard'], div=int(ctl['div']), pann_us=pann, centre=ctl['centre'],
+                                                       window_us=ctl['window'])
                                 if fields and ctl['grid']:
-                                    fields = glock.apply(fields, cm, now, ctl['slew'], ctl['dead'], settled=ev.host_per_fpga != 1.0)
+                                    fields = glock.apply(fields, cm, now, ctl['slew'], ctl['dead'], settled=ev.host_per_fpga != 1.0, epoch=ev.epoch)
                                 if fields:
                                     fields = restamp(fields, ctl, now, t_start)
+                                    fields = apply_adj(fields, 50 * osd_adj + ctl['adj'])
                         if fields:
                             last_fields = fields
                             payload = beacon_payload(*fields)
@@ -377,7 +456,7 @@ def main():
                             mode = '2D'
                     h.cmd(op(3, 0x76), struct.pack('<BBB', 1, 3, len(payload)) + payload, 'csb data')
                     n_beacons += 1
-                    if now >= next_dump:
+                    if now >= next_dump and (cm.fit or st_phases):
                         next_dump = now + 5.0
                         c_now = cm.ticks_at(time.monotonic()) if not st_phases else read_clock(h)
                         c_ann = int.from_bytes(payload[0:4], 'little') + int.from_bytes(payload[4:6], 'little') / TICK_US

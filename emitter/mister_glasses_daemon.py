@@ -34,7 +34,8 @@ WATCHDOG_S = 0.30                    # no event for this long while active -> re
 CLK_NTSC = 53693175.0                # core clock, Hz
 CLK_PAL = 53203425.0
 CLK_FAST = 6.25e6 * (8 + 3358154979 / 2 ** 32)   # +2.2% glasses sync clock, flags bit5
-CLK_VB = 40000000.0                              # Virtual Boy core clock, flags bit6
+CLK_GROOVY = 82753648.0                           # Groovy core clock, flags bit7
+CLK_VB = 40000000.0                             # Virtual Boy core clock, flags bit6
 
 
 def open_ring():
@@ -129,7 +130,7 @@ def main():
             for seq, flags, magic, ts in new:
                 if flags & 0x10:
                     continue                  # frame-start events are for the Bluetooth emitter; the IR path wants the write instants
-                clk = CLK_VB if flags & 0x40 else (CLK_FAST if flags & 0x20 else (CLK_PAL if flags & 4 else CLK_NTSC))
+                clk = CLK_GROOVY if flags & 0x80 else CLK_VB if flags & 0x40 else (CLK_FAST if flags & 0x20 else (CLK_PAL if flags & 4 else CLK_NTSC))
                 if last_ts is not None:
                     unwrapped += ((ts - last_ts) & 0xFFFFFFFF) / clk
                 last_ts = ts

@@ -6,12 +6,13 @@ reg clk_sys = 0;
 always #9.311 clk_sys = ~clk_sys;      // 53.693 MHz (NTSC core clock)
 
 reg reset = 1, enable = 1, swap = 0, pal = 0, fast = 0, wr = 0, eye = 0, vblank = 0, ddr_ok = 1;
+reg [5:0] sync_adj = 0;
 reg DDRAM_BUSY = 0;
 wire [28:0] DDRAM_ADDR; wire [63:0] DDRAM_DIN; wire [7:0] DDRAM_BE; wire DDRAM_WE;
 
 glasses3d #(.IDLE_FRAMES(3)) dut
 (
-	.clk_sys(clk_sys), .reset(reset), .enable(enable), .swap(swap), .pal(pal), .fast(fast),
+	.clk_sys(clk_sys), .reset(reset), .enable(enable), .swap(swap), .pal(pal), .fast(fast), .sync_adj(sync_adj),
 	.wr(wr), .eye(eye), .vblank(vblank),
 	.ddr_ok(ddr_ok), .DDRAM_BUSY(DDRAM_BUSY),
 	.DDRAM_ADDR(DDRAM_ADDR), .DDRAM_DIN(DDRAM_DIN), .DDRAM_BE(DDRAM_BE), .DDRAM_WE(DDRAM_WE)
@@ -29,13 +30,20 @@ integer i;
 initial for (i = 0; i < 512; i = i + 1) mem[i] = 0;
 
 integer busy_rate = 30;
+reg [63:0] set_word = 0;
+integer set_writes = 0;
 integer writes_accepted = 0;
 always @(posedge clk_sys) begin
 	if (DDRAM_WE && !DDRAM_BUSY) begin
-		check(DDRAM_ADDR >= BASE && DDRAM_ADDR < BASE + 512, "write address outside the ring");
-		check(DDRAM_ADDR[2:0] == 3'b000, "entries are 64-byte aligned");
-		mem[DDRAM_ADDR - BASE] = DDRAM_DIN;
-		writes_accepted = writes_accepted + 1;
+		if (DDRAM_ADDR == BASE - 29'd8) begin          // the settings word
+			set_word = DDRAM_DIN;
+			set_writes = set_writes + 1;
+		end else begin
+			check(DDRAM_ADDR >= BASE && DDRAM_ADDR < BASE + 512, "write address outside the ring");
+			check(DDRAM_ADDR[2:0] == 3'b000, "entries are 64-byte aligned");
+			mem[DDRAM_ADDR - BASE] = DDRAM_DIN;
+			writes_accepted = writes_accepted + 1;
+		end
 		check(DDRAM_BE == 8'hFF, "byte enable");
 	end
 	DDRAM_BUSY <= ($urandom % 100) < busy_rate;
@@ -169,6 +177,15 @@ initial begin
 	expect_event(seq_n - 1, 1, 0, "fast flag, write event");
 	expect_event(seq_n,     1, 1, "fast flag, frame event");
 	fast = 0;
+
+	// 9c) the OSD sync adjust is published in the settings word, immediately on change
+	t0 = set_writes;
+	sync_adj = 6'd7; #2_000;
+	check(set_writes > t0, "a changed setting is written");
+	check(set_word[63:56] == 8'h5E && set_word[55:48] == 8'h01 && set_word[47:40] == 8'd7 && set_word[39:0] == 40'd0, "settings word fields");
+	sync_adj = 6'd35; #2_000;
+	check(set_word[47:40] == 8'd35, "negative setting index");
+	sync_adj = 0;
 
 	// 10) disable: no traffic
 	enable = 0; #1_000;

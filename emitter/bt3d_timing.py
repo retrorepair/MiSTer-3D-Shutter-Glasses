@@ -16,7 +16,8 @@ TICK_US = 312.5          # Bluetooth native clock tick (3.2 kHz)
 CLK_NTSC = 53693175.0    # SMS core clock, Hz (flags bit2 = PAL)
 CLK_PAL = 53203425.0
 CLK_FAST = 6.25e6 * (8 + 3358154979 / 2 ** 32)    # the +2.2% glasses sync clock (flags bit5), see SMS.sv
-CLK_VB = 40000000.0                               # Virtual Boy core clk_sys (flags bit6)
+CLK_GROOVY = 82753648.0                           # Groovy core clk_sys (flags bit7)
+CLK_VB = 40000000.0                              # Virtual Boy core clk_sys (flags bit6)
 
 
 def linfit(xs, ys):
@@ -34,8 +35,8 @@ def linfit(xs, ys):
 class ClockMap:
     """host monotonic time (s) -> Bluetooth native clock (ticks, unwrapped), from Read_Clock samples."""
 
-    def __init__(self, keep=160):
-        self.samples = deque(maxlen=keep)     # (t_mid, rtt, ticks)
+    def __init__(self, keep=1200):
+        self.samples = deque(maxlen=keep)     # (t_mid, rtt, ticks): 5 minutes at 4 per second
         self.last = None
         self.base_t = None
         self.fit = None                       # (a, b): reported units = a + b * (t - base_t)
@@ -103,9 +104,14 @@ class EventClock:
         self.buckets = deque(maxlen=300)      # (fpga second, smallest arrival - fpga offset in that second)
         self.bucket_id = None
         self.bucket_min = None
+        self.cycles = 0                       # FPGA cycles since the first event (exact)
+        self.prev_frame_cycles = None
+        self.prev_frame_eye = None
+        self.frame_deltas = deque(maxlen=60)  # cycles between consecutive frame events: exactly half a left+right pair
+        self.epoch = 0                        # +1 whenever the left-eye frames moved to the other half of the pair period
 
     def add(self, ts, flags, arrival):
-        clk = CLK_VB if flags & 0x40 else (CLK_FAST if flags & 0x20 else (CLK_PAL if flags & 4 else CLK_NTSC))
+        clk = CLK_GROOVY if flags & 0x80 else CLK_VB if flags & 0x40 else (CLK_FAST if flags & 0x20 else (CLK_PAL if flags & 4 else CLK_NTSC))
         if clk != self.clk_prev:              # the core clock was switched: earlier offsets no longer line up
             self.offsets.clear()
             self.buckets.clear()
@@ -116,6 +122,7 @@ class EventClock:
             if d > 0x80000000:                # an older timestamp than one already seen: a damaged read, drop it
                 return
             self.fpga_s += d / clk
+            self.cycles += d
         self.last_ts = ts
         self.offsets.append(arrival - self.fpga_s)
         bid = int(self.fpga_s)
@@ -133,10 +140,42 @@ class EventClock:
             self.left_writes.clear()
         elif flags & 0x10:
             self.last_frame_event_t = arrival
+            eye = flags & 1
+            if self.prev_frame_cycles is not None:
+                delta = self.cycles - self.prev_frame_cycles
+                med = self._median_delta()
+                regular = med is None or abs(delta - med) <= 0.02 * med
+                if regular:
+                    self.frame_deltas.append(delta)
+                if not regular or eye == self.prev_frame_eye:
+                    # a dropout, or two frames of one eye in a row: the game's eye order moved by a frame, so the
+                    # left-eye frames collected so far belong to the other half of the pair period
+                    self.left_frames.clear()
+                    self.epoch += 1
+            self.prev_frame_cycles = self.cycles
+            self.prev_frame_eye = eye
             if flags & 1:
                 self.left_frames.append(self.fpga_s)
         elif flags & 1:
             self.left_writes.append(self.fpga_s)
+
+    def _median_delta(self):
+        if len(self.frame_deltas) < 8:
+            return None
+        d = sorted(self.frame_deltas)
+        return d[len(d) // 2]
+
+    @property
+    def pair_cycles(self):
+        """FPGA cycles in one left+right pair: twice the median spacing of consecutive frame events.  Exact (the core's video
+        timing is an integer number of cycles), and a dropout or an eye-order flip cannot disturb a median over 60 frames."""
+        med = self._median_delta()
+        return None if med is None else 2.0 * med
+
+    @property
+    def pair_seconds(self):
+        pc = self.pair_cycles
+        return None if pc is None or self.clk_prev is None else pc / self.clk_prev
 
     @property
     def host_per_fpga(self):
@@ -183,12 +222,16 @@ def frame_fit(times):
     return times[0] + c0 + p * k_last, p
 
 
-def beacon_fields(frame_t, period_s, cmap, lead_us=1500.0, tail_us=2700.0, shift_us=0.0, swap=False, guard_us=600.0, div=1, pann_us=0.0, centre=0.0):
+def beacon_fields(frame_t, period_s, cmap, lead_us=900.0, tail_us=2700.0, shift_us=0.0, swap=False, guard_us=1100.0, div=1, pann_us=0.0, centre=0.0,
+                  window_us=13900.0):
     """Everything the 3D beacon needs, or None when the clock map is not ready.
 
     frame_t is the host time at which a left-eye picture starts.  Each eye's lens opens lead_us before its picture
     starts (inside the dark blanking interval, so the lens has finished opening when the picture appears) and starts
     closing tail_us before the next picture starts.  tail_us - lead_us is the dark gap between the two eyes.
+    With window_us > 0 each lens is instead open for exactly that long (tail_us is ignored): the default 13.9 ms covers
+    the 12.3 ms picture with 0.9 ms before it and 0.7 ms after it, and leaves guard_us of room on both sides of the
+    windows inside the period so the OSD sync adjust (+-1 ms) can move them without leaving it.
     The beacon's frame-sync instant is placed guard_us before the first lens opens, so all four offsets lie inside the
     frame period (0 <= offset < period), like the shutter patterns that were verified on the glasses.
     Returns (clk28, phase_us, l_open, l_close, r_open, r_close, period_us, frac256)."""
@@ -207,10 +250,11 @@ def beacon_fields(frame_t, period_s, cmap, lead_us=1500.0, tail_us=2700.0, shift
     p_int = int(p_us)
     frac = int((p_us - p_int) * 256)
     half = p_true / 2.0                                  # the right picture really starts half a real period later
+    gap = (half - window_us) if window_us > 0 else (tail_us - lead_us)          # dark time between the eyes
     lo = guard_us
-    lc = guard_us + half - (tail_us - lead_us)
+    lc = guard_us + half - gap
     ro = guard_us + half
-    rc = min(guard_us + p_true - (tail_us - lead_us), p_us - 400.0)    # every offset must stay inside the announced period
+    rc = min(guard_us + p_true - gap, p_us - 400.0)    # every offset must stay inside the announced period
     if swap:
         lo, lc, ro, rc = ro, rc, lo, lc
     clamp = lambda v: max(0, min(65535, int(round(v))))

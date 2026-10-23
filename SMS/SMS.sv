@@ -265,6 +265,7 @@ parameter CONF_STR = {
 	"P3O[68],USB sync output,Off,On;",
 	"P3O[69],Eye order,Normal,Swapped;",
 	"P3O[70],Glasses sync clock +2.2%,Off,On;",
+	"P3O[77:72],Sync adjust (ms),0.00,+0.05,+0.10,+0.15,+0.20,+0.25,+0.30,+0.35,+0.40,+0.45,+0.50,+0.55,+0.60,+0.65,+0.70,+0.75,+0.80,+0.85,+0.90,+0.95,+1.00,-1.00,-0.95,-0.90,-0.85,-0.80,-0.75,-0.70,-0.65,-0.60,-0.55,-0.50,-0.45,-0.40,-0.35,-0.30,-0.25,-0.20,-0.15,-0.10,-0.05;",
 
 	"-;",
 	"H8RB,Soft Reset;",
@@ -996,6 +997,7 @@ glasses3d glasses3d
 	.swap(status[69]),
 	.pal(pal),
 	.fast(pll_fast),
+	.sync_adj(status[77:72]),
 	.wr(g3d_wr),
 	.eye(g3d_eye),
 	.vblank(VBlank),
