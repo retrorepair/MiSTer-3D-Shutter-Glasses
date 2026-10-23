@@ -1,0 +1,345 @@
+diff --git a/SMS.sv b/SMS.sv
+index f36d4e7..259c191 100644
+--- a/SMS.sv
++++ b/SMS.sv
+@@ -260,6 +260,12 @@ parameter CONF_STR = {
+ 	"P2oQ,SC-3000,Off,On;",
+ 	"P2oRS,SG/SC Cart RAM,Off,2KB,16KB,32KB;",
+ 
++	"P3,3D Glasses;",
++	"P3-;",
++	"P3O[68],USB sync output,Off,On;",
++	"P3O[69],Eye order,Normal,Swapped;",
++	"P3O[70],Glasses sync clock +2.2%,Off,On;",
++
+ 	"-;",
+ 	"H8RB,Soft Reset;",
+ 	"H8R9,Eject ROM;",
+@@ -323,18 +329,22 @@ pll_cfg pll_cfg
+ 	.reconfig_from_pll(reconfig_from_pll)
+ );
+ 
++// Core clock modes: 0 = NTSC, 1 = PAL, 2 = NTSC +2.2% for the Bluetooth 3D glasses (see rtl/glasses3d.sv).
++// Bluetooth 3D shutter glasses cannot be given a frame period above 32767 us (their period counter is 15 bits),
++// and the Master System's left+right frame pair lasts 33376 us. Running the core 2.2% fast brings the pair to about
++// 32650 us so the glasses can hold lock. The fractional PLL word K gives f = 6.25 MHz x (8 + K / 2^32).
+ always @(posedge CLK_50M) begin
+-	reg pald = 0, pald2 = 0;
++	reg [1:0] modd = 0, modd2 = 0;
+ 	reg [2:0] state = 0;
+-	reg pal_r;
++	reg [1:0] mode_r = 0;
+ 
+-	pald <= pal;
+-	pald2 <= pald;
++	modd <= {pll_fast, pal};
++	modd2 <= modd;
+ 
+ 	cfg_write <= 0;
+-	if(pald2 == pald && pald2 != pal_r) begin
++	if(modd2 == modd && modd2 != mode_r) begin
+ 		state <= 1;
+-		pal_r <= pald2;
++		mode_r <= modd2;
+ 	end
+ 
+ 	if(!cfg_waitrequest) begin
+@@ -347,7 +357,7 @@ always @(posedge CLK_50M) begin
+ 				end
+ 			5: begin
+ 					cfg_address <= 7;
+-					cfg_data <= pal_r ? 2201376125 : 2537930535;
++					cfg_data <= mode_r[0] ? 2201376125 : (mode_r[1] ? 3358154979 : 2537930535);
+ 					cfg_write <= 1;
+ 				end
+ 			7: begin
+@@ -967,6 +977,36 @@ wire [14:0] ss_nvram_WA;   // DMA write address
+ wire  [7:0] ss_nvram_WD;   // DMA write data
+ // nvram_q feeds ss_nvram_D directly (read data back to savestates)
+ 
++// SegaScope 3-D glasses: the game writes $FFF8-$FFFB once per frame to pick the open lens.
++// The lens state is published to DDR3 for a USB emitter (see rtl/glasses3d.sv).
++wire        g3d_eye, g3d_wr;
++wire        g3d_ddr_we;
++wire [28:0] g3d_ddr_addr;
++wire [63:0] g3d_ddr_din;
++wire  [7:0] g3d_ddr_be;
++wire        g3d_ddr_sel = g3d_ddr_we;                 // a telemetry write owns the bus until it is accepted
++// screen_rotate only uses DDR3 while the screen is rotated or flipped; savestates own it while frozen.
++wire        g3d_ddr_ok = ~ss_freeze & no_rotate & ~flip;
++
++glasses3d glasses3d
++(
++	.clk_sys(clk_sys),
++	.reset(reset_active),
++	.enable(status[68] & ~gg & ~systeme),
++	.swap(status[69]),
++	.pal(pal),
++	.fast(pll_fast),
++	.wr(g3d_wr),
++	.eye(g3d_eye),
++	.vblank(VBlank),
++	.ddr_ok(g3d_ddr_ok),
++	.DDRAM_BUSY(DDRAM_BUSY),
++	.DDRAM_ADDR(g3d_ddr_addr),
++	.DDRAM_DIN(g3d_ddr_din),
++	.DDRAM_BE(g3d_ddr_be),
++	.DDRAM_WE(g3d_ddr_we)
++);
++
+ system #(63) system
+ (
+ 	.clk_sys(clk_sys),
+@@ -1021,6 +1061,8 @@ system #(63) system
+ 	.j2_th(joyb_th),
+ 	.pause(systeme ? 1'b1 : (joya[6]&joyb[6])),
+ 	.se_pause(se_pause_gate),
++	.g3d_eye(g3d_eye),
++	.g3d_wr(g3d_wr),
+ 	.soft_reset(soft_reset_btn),
+ 	.j2_start(swap ? joy_0[6] : joy_1[6]),
+ 	.j2_coin(swap ? joy_0[7] : joy_1[7]),
+@@ -1312,12 +1354,12 @@ savestates savestates_inst (
+ );
+ 
+ assign DDRAM_CLK      = clk_sys; // always stable; sr_ddram_clk (CLK_VIDEO) would glitch on ss_freeze toggle
+-assign DDRAM_BURSTCNT = ss_freeze ? ss_ddram_burstcnt : sr_ddram_burstcnt;
+-assign DDRAM_ADDR     = ss_freeze ? ss_ddram_addr     : sr_ddram_addr;
+-assign DDRAM_DIN      = ss_freeze ? ss_ddram_din      : sr_ddram_din;
+-assign DDRAM_BE       = ss_freeze ? ss_ddram_be       : sr_ddram_be;
+-assign DDRAM_WE       = ss_freeze ? ss_ddram_we       : sr_ddram_we;
+-assign DDRAM_RD       = ss_freeze ? ss_ddram_rd       : sr_ddram_rd;
++assign DDRAM_BURSTCNT = g3d_ddr_sel ? 8'd1          : ss_freeze ? ss_ddram_burstcnt : sr_ddram_burstcnt;
++assign DDRAM_ADDR     = g3d_ddr_sel ? g3d_ddr_addr  : ss_freeze ? ss_ddram_addr     : sr_ddram_addr;
++assign DDRAM_DIN      = g3d_ddr_sel ? g3d_ddr_din   : ss_freeze ? ss_ddram_din      : sr_ddram_din;
++assign DDRAM_BE       = g3d_ddr_sel ? g3d_ddr_be    : ss_freeze ? ss_ddram_be       : sr_ddram_be;
++assign DDRAM_WE       = g3d_ddr_sel ? g3d_ddr_we    : ss_freeze ? ss_ddram_we       : sr_ddram_we;
++assign DDRAM_RD       = g3d_ddr_sel ? 1'b0          : ss_freeze ? ss_ddram_rd       : sr_ddram_rd;
+ 
+ wire [12:0] key_a;
+ wire [7:0] key_d;
+@@ -1529,6 +1571,7 @@ wire [11:0] color;
+ wire mask_column;
+ wire smode_M1, smode_M2, smode_M3, smode_M4;
+ wire pal = status[2];
++wire pll_fast = status[68] & status[70] & ~status[2] & ~gg & ~systeme;   // 3D glasses sync clock (NTSC only)
+ // Evolution's Sonic Drift 2 uses GG CRAM and controls on a TV-sized raster.
+ // Keep the full SMS output, including the original game's off-screen garbage.
+ wire gg_video = gg;
+diff --git a/files.qip b/files.qip
+index 5a3664b..3505ff6 100644
+--- a/files.qip
++++ b/files.qip
+@@ -1,6 +1,7 @@
+ set_global_assignment -name QIP_FILE rtl/T80/T80.qip
+ set_global_assignment -name QIP_FILE rtl/VM2413/OPLL.qip
+ set_global_assignment -name QIP_FILE rtl/jt89/jt89.qip
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/glasses3d.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestate_ui.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/savestates.sv
+ set_global_assignment -name VERILOG_FILE rtl/MC8123.v
+diff --git a/rtl/glasses3d.sv b/rtl/glasses3d.sv
+new file mode 100644
+index 0000000..0ee514f
+--- /dev/null
++++ b/rtl/glasses3d.sv
+@@ -0,0 +1,153 @@
++//============================================================================
++//  SegaScope 3-D glasses support for the SMS core
++//
++//  The Sega 3-D glasses adapter sits in the card slot and snoops the Z80 bus.
++//  A write to $FFF8-$FFFB (the adapter ignores A1:A0) selects the open lens:
++//  bit 0 = 1 -> left lens open, bit 0 = 0 -> right lens open. The games write
++//  it once per displayed frame, so each eye gets every other frame.
++//
++//  The FPGA has no USB, so events are published to DDR3 where the MiSTer's ARM
++//  side can read them (/dev/mem) and forward them to an emitter. They go into a
++//  ring of 64 entries of 64 bytes at DDR3 byte address 0x3DFFF000 (entry =
++//  sequence number mod 64); only the first 64-bit word of an entry is used:
++//
++//     [63:48] sequence number (+1 per event)    [47:40] flags
++//     [39:32] magic 0x5D                        [31:0]  clk_sys cycle counter
++//                                                       at the event
++//     flags: bit0 left lens open (1) / right lens open (0), after eye swap
++//            bit1 a 3-D game wrote the register within the last IDLE_FRAMES
++//            bit2 PAL timing       bit3 3-D output enabled in the OSD
++//            bit5 core clock is the +2.2% glasses sync clock (clk_sys = 54.8868 MHz instead of 53.693175 MHz)
++//            bit4 frame event: the picture of a new frame starts now (end of
++//                 vertical blanking) with this eye; 0 = a write event
++//
++//  Events: every game write (the instant the real adapter would flip the
++//  shutters), every frame start while a 3-D game is running (exact video
++//  timing, for emitters that lock to the display), activity timing out, and an
++//  eye swap while active.
++//============================================================================
++
++module glasses3d #(parameter IDLE_FRAMES = 30)
++(
++	input         clk_sys,
++	input         reset,
++	input         enable,        // OSD: publish events
++	input         swap,          // OSD: exchange the eyes
++	input         pal,
++	input         fast,         // clk_sys runs at the +2.2% glasses sync clock
++	input         wr,            // one clk_sys pulse after each $FFF8-$FFFB write
++	input         eye,           // bit 0 of the last write: 1 = left open, 0 = right open
++	input         vblank,
++
++	input         ddr_ok,        // the DDRAM bus is free to start a transaction
++	input         DDRAM_BUSY,
++	output [28:0] DDRAM_ADDR,    // 64-bit word address
++	output [63:0] DDRAM_DIN,
++	output  [7:0] DDRAM_BE,
++	output        DDRAM_WE
++);
++
++localparam [28:0] BASE = 29'h07BFFE00;   // byte address 0x3DFFF000
++
++// ---------------------------------------------------------------------------
++//  Activity: a 3-D game writes the register every frame; if nothing has been
++//  written for IDLE_FRAMES frames the game is not using the glasses.
++// ---------------------------------------------------------------------------
++reg [5:0] idle_frames = IDLE_FRAMES;
++wire      act_now = enable & (idle_frames != IDLE_FRAMES);
++reg       old_vblank = 0;
++reg       active_r = 0;
++reg       old_swap = 0;
++
++always @(posedge clk_sys) begin
++	old_vblank <= vblank;
++	old_swap   <= swap;
++
++	if (~old_vblank & vblank && idle_frames != IDLE_FRAMES)
++		idle_frames <= idle_frames + 1'd1;
++
++	if (wr)
++		idle_frames <= 0;
++
++	if (reset | ~enable)
++		idle_frames <= IDLE_FRAMES;
++
++	active_r <= act_now;
++end
++
++// ---------------------------------------------------------------------------
++//  Event queue
++// ---------------------------------------------------------------------------
++reg [31:0] ts = 0;
++always @(posedge clk_sys) ts <= ts + 1'd1;
++
++wire       eye_eff   = eye ^ swap;
++wire [7:0] flags_on  = {2'd0, fast, 1'b0, enable, pal, 1'b1, eye_eff};
++wire [7:0] flags_off = {2'd0, fast, 1'b0, enable, pal, 1'b0, 1'b1};
++
++wire ev_wr    = wr;
++wire ev_frame = act_now & old_vblank & ~vblank;          // picture of a new frame starts
++wire ev_off   = active_r & ~act_now;
++wire ev_swap  = act_now & (swap != old_swap);
++wire ev_any   = ev_wr | ev_frame | ev_off | ev_swap;
++wire [7:0] ev_flags = ev_off ? flags_off : (ev_frame ? (flags_on | 8'h10) : flags_on);
++
++reg [15:0] seq = 0;
++reg [55:0] fifo [0:7];
++reg  [2:0] f_wp = 0, f_rp = 0;
++reg  [3:0] f_cnt = 0;
++
++wire        f_empty = (f_cnt == 0);
++wire [55:0] f_head  = fifo[f_rp];
++reg         pop;
++
++always @(posedge clk_sys) begin
++	if (reset | ~enable) begin
++		seq   <= 0;
++		f_wp  <= 0;
++		f_rp  <= 0;
++		f_cnt <= 0;
++	end else begin
++		if (ev_any) begin
++			fifo[f_wp] <= {seq + 1'd1, ev_flags, ts};
++			seq        <= seq + 1'd1;
++			f_wp       <= f_wp + 1'd1;
++		end
++		if (pop) f_rp <= f_rp + 1'd1;
++
++		case ({ev_any, pop})
++			2'b10: f_cnt <= (f_cnt == 4'd8) ? f_cnt : f_cnt + 1'd1;
++			2'b01: f_cnt <= f_cnt - 1'd1;
++			default: ;
++		endcase
++		// full queue: the oldest entry is overwritten
++		if (ev_any && f_cnt == 4'd8 && !pop) f_rp <= f_rp + 1'd1;
++	end
++end
++
++// ---------------------------------------------------------------------------
++//  DDR3 writer: one single-beat write per event
++// ---------------------------------------------------------------------------
++reg [63:0] din = 0;
++reg [28:0] addr = BASE;
++reg        we = 0;
++
++always @(posedge clk_sys) begin
++	pop <= 0;
++
++	if (we) begin
++		if (!DDRAM_BUSY) we <= 0;                   // accepted
++	end else if (!f_empty && ddr_ok && enable) begin
++		din  <= {f_head[55:40], f_head[39:32], 8'h5D, f_head[31:0]};
++		addr <= BASE + {20'd0, f_head[45:40], 3'b000};
++		we   <= 1;
++		pop  <= 1;
++	end
++end
++
++assign DDRAM_ADDR = addr;
++assign DDRAM_DIN  = din;
++assign DDRAM_BE   = 8'hFF;
++assign DDRAM_WE   = we;
++
++endmodule
+diff --git a/rtl/system.vhd b/rtl/system.vhd
+index b8cbea8..c6dde9b 100644
+--- a/rtl/system.vhd
++++ b/rtl/system.vhd
+@@ -214,6 +214,10 @@ entity system is
+ 		-- System E hardware pause: gates Z80 clock independently of ce_pix
+ 		-- (ce_pix keeps running so VDP scanout and sync are unaffected)
+ 		se_pause      : in  STD_LOGIC := '0';
++		-- SegaScope 3-D glasses: bit 0 of the last memory write to $FFF8-$FFFB
++		-- (1 = left lens open, 0 = right lens open) and a pulse after each write
++		g3d_eye       : out STD_LOGIC;
++		g3d_wr        : out STD_LOGIC;
+ 		ss_freeze     : in  STD_LOGIC := '0'
+ 	);
+ end system;
+@@ -285,6 +289,7 @@ architecture Behavioral of system is
+ 	signal evolution_gg_mode     : std_logic;
+ 	signal effective_vdp_gg      : std_logic;
+ 	signal effective_gg          : std_logic;
++	signal g3d_wr_q              : std_logic := '0';
+ 	signal evolution_launch_fetch_addr : std_logic_vector(15 downto 0);
+ 	signal mapper_evolution : std_logic;
+ 
+@@ -960,6 +965,22 @@ port map(
+ 		 A(7 downto 0)=x"88" or A(7 downto 0)=x"8C" or
+ 		 A(7 downto 0)=x"8D" or A(7 downto 0)=x"8E" or
+ 		 A(7 downto 0)=x"8F" or A(7 downto 0)=x"CD") else '0';
++	-- SegaScope 3-D glasses adapter: it snoops memory writes to $FFF8-$FFFB (A1:A0 are
++	-- ignored by the adapter). The write also lands in work RAM at $DFF8-$DFFB.
++	process (clk_sys)
++	begin
++		if rising_edge(clk_sys) then
++			g3d_wr <= '0';
++			if ss_freeze = '0' and MREQ_n = '0' and WR_n = '0' and A(15 downto 2) = "11111111111110" and gg = '0' and systeme = '0' then
++				g3d_eye  <= D_in(0);
++				g3d_wr_q <= '1';
++			else
++				g3d_wr   <= g3d_wr_q;  -- pulse once the write cycle has ended
++				g3d_wr_q <= '0';
++			end if;
++		end if;
++	end process;
++
+ 	z80_m1_n   <= M1_n;
+ 	z80_mreq_n <= MREQ_n;
+ 	z80_iset   <= z80_iset_int;
