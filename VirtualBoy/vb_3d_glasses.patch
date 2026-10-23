@@ -1,0 +1,493 @@
+diff --git a/VirtualBoy.sv b/VirtualBoy.sv
+index a7a8f05..f55bbf4 100644
+--- a/VirtualBoy.sv
++++ b/VirtualBoy.sv
+@@ -247,7 +247,9 @@ module emu
+ 	// Active-low so the all-zero power-on/menu state selects true black.
+ 	wire       palette_true_black          = !status[41];
+ 	wire       serial_rumble_enable        = !status[28];
+-	wire       video_60hz_compat_requested = status[29];
++	// Eye Sequential (3D shutter glasses) shows one eye per frame on a 61.5 Hz raster, so it implies the 60 Hz timing.
++	wire       shutter_mode = status[48];
++	wire       video_60hz_compat_requested = status[29] | shutter_mode;
+ 	wire       crop_216_enabled            = status[31];
+ 	wire [3:0] crop_offset_choice          = status[35:32];
+ 	wire [1:0] video_scale                 = status[37:36];
+@@ -294,6 +296,8 @@ module emu
+ 		"H0P1O[19:17],R Color,Red,Magenta,Blue,Cyan,Green,Yellow,White;",
+ 		"P1O[27:25],Stereo Scale,100%,75%,62.5%,50%,37.5%,25%,12.5%,0%;",
+ 		"P1O[8:7],Eye Drawn,Left,Right,Both,Side by Side;",
++		"P1O[48],Eye Sequential (3D shutter glasses),Off,On;",
++		"P1O[49],Shutter Eye Order,Normal,Swapped;",
+ 		"P1-;",
+ 		"P1O[29],Video Timing,Native 50 Hz,Buffered 60 Hz;",
+ 		"P1O[2:1],Aspect Ratio,Original,Full Screen,[ARC1],[ARC2];",
+@@ -1268,6 +1272,61 @@ module emu
+ 		.shared_ready_i (shared_aux_ddr_ready)
+ 	);
+ 
++	wire [27:1] eye_ddr_addr;
++	wire [63:0] eye_ddr_din;
++	wire        eye_ddr_req;
++	wire        eye_ddr_rnw;
++	wire [7:0]  eye_ddr_be;
++	wire        eye_ddr_ready;
++	wire [63:0] eye_ddr_dout_unused;
++	wire [27:1] shared2_ddr_addr;
++	wire [63:0] shared2_ddr_dout;
++	wire [63:0] shared2_ddr_din;
++	wire        shared2_ddr_req;
++	wire        shared2_ddr_rnw;
++	wire [7:0]  shared2_ddr_be;
++	wire        shared2_ddr_ready;
++
++	vb_eyesync u_eyesync (
++		.clk_i         (clk_sys),
++		.reset_i       (~pll_locked),
++		.enable_i      (shutter_mode),
++		.frame_start_i (video_frame_wrap),
++		.eye_left_i    (shutter_next_eye_left),
++		.ddr_addr_o    (eye_ddr_addr),
++		.ddr_din_o     (eye_ddr_din),
++		.ddr_req_o     (eye_ddr_req),
++		.ddr_rnw_o     (eye_ddr_rnw),
++		.ddr_be_o      (eye_ddr_be),
++		.ddr_ready_i   (eye_ddr_ready)
++	);
++
++	vb_ddr_channel_arbiter u_eye_ddr_arbiter (
++		.clk_i          (clk_sys),
++		.reset_i        (~pll_locked),
++		.ch1_addr_i     (shared_aux_ddr_addr),
++		.ch1_dout_o     (shared_aux_ddr_dout),
++		.ch1_din_i      (shared_aux_ddr_din),
++		.ch1_req_i      (shared_aux_ddr_req),
++		.ch1_rnw_i      (shared_aux_ddr_rnw),
++		.ch1_be_i       (shared_aux_ddr_be),
++		.ch1_ready_o    (shared_aux_ddr_ready),
++		.ch2_addr_i     (eye_ddr_addr),
++		.ch2_dout_o     (eye_ddr_dout_unused),
++		.ch2_din_i      (eye_ddr_din),
++		.ch2_req_i      (eye_ddr_req),
++		.ch2_rnw_i      (eye_ddr_rnw),
++		.ch2_be_i       (eye_ddr_be),
++		.ch2_ready_o    (eye_ddr_ready),
++		.shared_addr_o  (shared2_ddr_addr),
++		.shared_dout_i  (shared2_ddr_dout),
++		.shared_din_o   (shared2_ddr_din),
++		.shared_req_o   (shared2_ddr_req),
++		.shared_rnw_o   (shared2_ddr_rnw),
++		.shared_be_o    (shared2_ddr_be),
++		.shared_ready_i (shared2_ddr_ready)
++	);
++
+ 	ddram u_savestate_ddram (
+ 		.DDRAM_CLK        (clk_sys),
+ 		.DDRAM_BUSY       (DDRAM_BUSY),
+@@ -1286,13 +1345,13 @@ module emu
+ 		.ch1_rnw          (savestate_ddr_rnw),
+ 		.ch1_be           (savestate_ddr_be),
+ 		.ch1_ready        (savestate_ddr_ack),
+-		.ch2_addr         (shared_aux_ddr_addr),
+-		.ch2_dout         (shared_aux_ddr_dout),
+-		.ch2_din          (shared_aux_ddr_din),
+-		.ch2_req          (shared_aux_ddr_req),
+-		.ch2_rnw          (shared_aux_ddr_rnw),
+-		.ch2_be           (shared_aux_ddr_be),
+-		.ch2_ready        (shared_aux_ddr_ready)
++		.ch2_addr         (shared2_ddr_addr),
++		.ch2_dout         (shared2_ddr_dout),
++		.ch2_din          (shared2_ddr_din),
++		.ch2_req          (shared2_ddr_req),
++		.ch2_rnw          (shared2_ddr_rnw),
++		.ch2_be           (shared2_ddr_be),
++		.ch2_ready        (shared2_ddr_ready)
+ 	);
+ 
+ 	savestate_ui #(
+@@ -1473,11 +1532,21 @@ module emu
+ 	wire [2:0] stereo_scale = status[27:25];
+ 	wire [1:0] eye_draw     = status[8:7];
+ 	wire       side_by_side_requested =
+-		(eye_draw == EYE_DRAW_SIDE_BY_SIDE);
++		(eye_draw == EYE_DRAW_SIDE_BY_SIDE) && !shutter_mode;
+ 	wire       side_by_side;
+ 	wire       video_60hz_compat;
+-	wire       draw_left_eye  = (eye_draw != EYE_DRAW_RIGHT);
+-	wire       draw_right_eye = (eye_draw != EYE_DRAW_LEFT);
++	wire       video_shutter_timing;
++	// Eye Sequential: the public raster alternates left and right frames. The eye of the frame that starts at
++	// video_frame_wrap is published to DDR3 by vb_eyesync (see below) for the Bluetooth shutter-glasses emitter.
++	reg        shutter_eye_q = 1'b0;                       // 0: this frame shows the left eye
++	wire       shutter_next_eye_left = ~((~shutter_eye_q) ^ status[49]);
++	wire       shutter_show_left     = ~(shutter_eye_q ^ status[49]);
++	always @(posedge clk_sys) begin
++		if (!pll_locked || !shutter_mode) shutter_eye_q <= 1'b0;
++		else if (video_frame_wrap) shutter_eye_q <= ~shutter_eye_q;
++	end
++	wire       draw_left_eye  = shutter_mode ? shutter_show_left  : (eye_draw != EYE_DRAW_RIGHT);
++	wire       draw_right_eye = shutter_mode ? ~shutter_show_left : (eye_draw != EYE_DRAW_LEFT);
+ 	wire       colorizer_dual_eye_draw = draw_left_eye && draw_right_eye &&
+ 		!side_by_side;
+ 	// Native mode supplies 1,280 normal or 2,560 side-by-side source steps per
+@@ -1541,9 +1610,10 @@ module emu
+ 		.link_clk_i                    (1'b0),
+ 		.link_rx_i                     (1'b0),
+ 		.link_sync_i                   (1'b0),
+-		.flat_dual_eye_i               (draw_right_eye),
++		.flat_dual_eye_i               (shutter_mode | draw_right_eye),
+ 		.side_by_side_i                (side_by_side),
+ 		.compat_60hz_i                 (video_60hz_compat),
++		.shutter_i                     (video_shutter_timing),
+ 		.parallax_scale_i              (stereo_scale),
+ 		.presentation_hlg_i            (presentation_hlg_enabled),
+ 		.brightness_table_legacy_sdr_i (brightness_table_legacy_sdr),
+@@ -1669,6 +1739,7 @@ module emu
+ 		.reset_i            (~pll_locked),
+ 		.side_by_side_req_i (side_by_side_requested),
+ 		.compat_60hz_req_i  (video_60hz_compat_requested),
++		.shutter_req_i      (shutter_mode),
+ 		.source_ce_i        (source_video_ce_core),
+ 		.source_present_i   (video_active),
+ 		.source_red_i       (vid_red),
+@@ -1678,6 +1749,7 @@ module emu
+ 		.source_vblank_i    (video_vblank_final),
+ 		.side_by_side_o     (side_by_side),
+ 		.compat_60hz_o      (video_60hz_compat),
++		.shutter_o          (video_shutter_timing),
+ 		.frame_wrap_o       (video_frame_wrap),
+ 		.pixel_ce_o         (CE_PIXEL),
+ 		.source_timing_ce_o (source_video_ce),
+diff --git a/files.qip b/files.qip
+index 91f00f6..59f17e9 100644
+--- a/files.qip
++++ b/files.qip
+@@ -9,6 +9,7 @@ set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_ddr_channel_arbiter.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_tas_player.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_video_output.sv
+ set_global_assignment -name VERILOG_FILE rtl/Mem/ddram.v
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_eyesync.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/Mem/vb_cart_rom.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/Mem/vb_cart_sdram.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/Mem/sdram.sv
+diff --git a/rtl/VIP/vip_core.sv b/rtl/VIP/vip_core.sv
+index bce4dd7..7dffdcf 100644
+--- a/rtl/VIP/vip_core.sv
++++ b/rtl/VIP/vip_core.sv
+@@ -61,6 +61,7 @@ module VIP
+ 	input  wire        flat_dual_eye_i,
+ 	input  wire        side_by_side_i,
+ 	input  wire        compat_60hz_i,
++	input  wire        shutter_i,
+ 	input  wire [2:0]  parallax_scale_i,
+ 	input  wire        presentation_hlg_i,
+ 	input  wire        brightness_table_legacy_sdr_i,
+@@ -480,6 +481,7 @@ module VIP
+ 		.flat_eye_i(1'b0),
+ 		.side_by_side_i(side_by_side_i),
+ 		.compat_60hz_i(compat_60hz_i),
++		.shutter_i(shutter_i),
+ 		.presentation_hlg_i(presentation_hlg_i),
+ 		.brightness_table_legacy_sdr_i(brightness_table_legacy_sdr_i),
+ 		.brightness_table_download_i(brightness_table_download_i),
+diff --git a/rtl/VIP/vip_host_display.sv b/rtl/VIP/vip_host_display.sv
+index 93e2b29..e31ce44 100644
+--- a/rtl/VIP/vip_host_display.sv
++++ b/rtl/VIP/vip_host_display.sv
+@@ -123,6 +123,7 @@ module vip_host_display_subsystem
+ 	input  wire         flat_eye_i,
+ 	input  wire         side_by_side_i,
+ 	input  wire         compat_60hz_i,
++	input  wire         shutter_i,
+ 	input  wire         presentation_hlg_i,
+ 	input  wire         brightness_table_legacy_sdr_i,
+ 	input  wire         brightness_table_download_i,
+@@ -861,6 +862,7 @@ module vip_host_display_subsystem
+ 		.flat_eye_i(flat_eye_i),
+ 		.side_by_side_i(side_by_side_i),
+ 		.compat_60hz_i(compat_60hz_i),
++		.shutter_i(shutter_i),
+ 		.presentation_hlg_i(presentation_hlg_i),
+ 		.brightness_table_legacy_sdr_i(brightness_table_legacy_sdr_i),
+ 		.brightness_table_download_i(brightness_table_download_i),
+@@ -1534,6 +1536,7 @@ module vip_display_subsystem
+ 	input  wire        flat_eye_i,
+ 	input  wire        side_by_side_i,
+ 	input  wire        compat_60hz_i,
++	input  wire        shutter_i,
+ 	input  wire        presentation_hlg_i,
+ 	input  wire        brightness_table_legacy_sdr_i,
+ 	input  wire        brightness_table_download_i,
+@@ -2409,6 +2412,7 @@ module vip_display_subsystem
+ 		.flat_eye_i(flat_eye_i),
+ 		.side_by_side_i(side_by_side_i),
+ 		.compat_60hz_i(compat_60hz_i),
++		.shutter_i(shutter_i),
+ 		.brightness_write_i(1'b0),
+ 		.brightness_eye_i(1'b0),
+ 		.brightness_group_i(7'd0),
+@@ -7576,6 +7580,7 @@ module vip_mister_scan_converter
+ 	// scheduler's already committed selection, so terminal blanking cannot let
+ 	// an asynchronous menu update split the two timing domains.
+ 	input  wire        compat_60hz_i,
++	input  wire        shutter_i,
+ 
+ 	// Brightness groups 0..95 map to x[8:2]. Ignore larger values and avoid
+ 	// same-address read/write collisions.
+@@ -7627,6 +7632,7 @@ module vip_mister_scan_converter
+ 	reg        raster_started_q;
+ 	reg        side_by_side_q;
+ 	reg        compat_60hz_q;
++	reg        shutter_q = 1'b0;      // 3D shutter-glasses raster (256 lines), committed by the public scheduler
+ 	reg        displayed_fb_q;
+ 	reg        handoff_discard_pending_q;
+ 	// X-defence: only a definite high on an undriven selector requests a
+@@ -7701,11 +7707,11 @@ module vip_mister_scan_converter
+ 	wire [15:0] raster_h_sync_end_w = side_by_side_q ?
+ 		(H_SYNC_END << 1) : H_SYNC_END;
+ 	wire [15:0] raster_last_x_w = raster_h_total_w - 16'd1;
+-	wire [15:0] raster_v_total_w = compat_60hz_q ? 16'd262 : V_TOTAL;
+-	wire [15:0] raster_v_sync_beg_w = compat_60hz_q ?
+-		16'd243 : V_SYNC_BEG;
+-	wire [15:0] raster_v_sync_end_w = compat_60hz_q ?
+-		16'd246 : V_SYNC_END;
++	wire [15:0] raster_v_total_w = shutter_q ? 16'd256 : (compat_60hz_q ? 16'd262 : V_TOTAL);
++	wire [15:0] raster_v_sync_beg_w = shutter_q ? 16'd237 : (compat_60hz_q ?
++		16'd243 : V_SYNC_BEG);
++	wire [15:0] raster_v_sync_end_w = shutter_q ? 16'd240 : (compat_60hz_q ?
++		16'd246 : V_SYNC_END);
+ 	wire [15:0] raster_last_y_w = raster_v_total_w - 16'd1;
+ 	wire        savestate_scan_bootstrap_w = !raster_started_q &&
+ 		(raster_x_q == 16'd0) && (raster_y_q == 16'd0);
+@@ -7950,6 +7956,7 @@ module vip_mister_scan_converter
+ 	task clear_scan_pipeline_task;
+ 		begin
+ 			compat_60hz_q <= compat_60hz_requested_t;
++			shutter_q <= shutter_i;
+ 			handoff_discard_pending_q <= 1'b0;
+ 			prefetch_valid_q <= 1'b0;
+ 			prefetch_x_q <= 9'd0;
+@@ -8034,9 +8041,9 @@ module vip_mister_scan_converter
+ 				 (savestate_state_wdata_i[42] ? (H_SYNC_END << 1) : H_SYNC_END));
+ 			video_vsync_o <=
+ 				(savestate_state_wdata_i[40:25] >=
+-				 (compat_60hz_requested_t ? 16'd243 : V_SYNC_BEG)) &&
++				 (shutter_i ? 16'd237 : (compat_60hz_requested_t ? 16'd243 : V_SYNC_BEG))) &&
+ 				(savestate_state_wdata_i[40:25] <
+-				 (compat_60hz_requested_t ? 16'd246 : V_SYNC_END));
++				 (shutter_i ? 16'd240 : (compat_60hz_requested_t ? 16'd246 : V_SYNC_END)));
+ 			raw_pixel_left_o <= 2'd0;
+ 			raw_pixel_right_o <= 2'd0;
+ 			video_luma_left_o <= 8'd0;
+@@ -8053,6 +8060,7 @@ module vip_mister_scan_converter
+ 			side_by_side_q <= side_by_side_requested_t;
+ 			if (ce_i && fetch_frame_start_w) begin
+ 				compat_60hz_q <= compat_60hz_requested_t;
++				shutter_q <= shutter_i;
+ 			end
+ 			if (EXTERNAL_BRIGHTNESS != 0) begin
+ 				if (external_brightness_pending_q !=
+diff --git a/b/rtl/vb_eyesync.sv b/rtl/vb_eyesync.sv
+new file mode 100644
+index 0000000..72f3488
+--- /dev/null
++++ b/rtl/vb_eyesync.sv
+@@ -0,0 +1,64 @@
++// 3D shutter-glasses telemetry for the Virtual Boy core.
++//
++// With OSD > Eye Sequential on, the public raster shows one eye per frame. At the start of every frame this module
++// writes an event to a ring in DDR3 (byte address 0x3DFFF000, 64 entries of 64 bytes, entry = sequence mod 64; same layout
++// as the SMS core's glasses3d) so the MiSTer's ARM side (usb_emitter/mister_bt3d.py) can steer Bluetooth 3D shutter glasses.
++//
++//     [63:48] sequence (+1 per event)   [47:40] flags   [39:32] magic 0x5D   [31:0] clk_sys cycle counter at the frame start
++//     flags: bit0 the frame that starts shows the left eye   bit1 active   bit3 enabled   bit4 frame-start event
++//            bit6 clk_sys is the 40 MHz Virtual Boy clock
++module vb_eyesync
++(
++	input  wire        clk_i,
++	input  wire        reset_i,
++	input  wire        enable_i,
++	input  wire        frame_start_i,      // one clk_i pulse at the start of each public frame
++	input  wire        eye_left_i,         // the eye shown in the frame that starts now
++
++	output reg  [27:1] ddr_addr_o,         // half-word address inside the 0x30000000 window (see ddram.v)
++	output reg  [63:0] ddr_din_o,
++	output reg         ddr_req_o,          // one-clock request pulse
++	output wire        ddr_rnw_o,
++	output wire [7:0]  ddr_be_o,
++	input  wire        ddr_ready_i
++);
++
++	localparam [26:0] BASE = 27'h6FFF800; // byte offset 0x0DFFF000 in the window = physical 0x3DFFF000
++
++	assign ddr_rnw_o = 1'b0;
++	assign ddr_be_o  = 8'hFF;
++
++	reg [31:0] ts = 32'd0;
++	reg [15:0] seq = 16'd0;
++	reg        pend = 1'b0;
++	reg        busy = 1'b0;
++	reg [63:0] pend_word = 64'd0;
++	reg  [5:0] pend_idx = 6'd0;
++
++	always @(posedge clk_i) begin
++		ts <= ts + 1'd1;
++		ddr_req_o <= 1'b0;
++
++		if (reset_i || !enable_i) begin
++			seq  <= 16'd0;
++			pend <= 1'b0;
++			busy <= 1'b0;
++		end else begin
++			if (frame_start_i) begin
++				seq       <= seq + 1'd1;
++				pend_idx  <= seq[5:0] + 1'd1;
++				pend_word <= {seq + 1'd1, 8'h5A | {7'd0, eye_left_i}, 8'h5D, ts};
++				pend      <= 1'b1;
++			end
++			if (pend && !busy) begin
++				ddr_addr_o <= BASE + {16'd0, pend_idx, 5'd0};
++				ddr_din_o  <= pend_word;
++				ddr_req_o  <= 1'b1;
++				busy       <= 1'b1;
++				pend       <= frame_start_i;     // a new event in this very cycle stays queued
++			end
++			if (busy && ddr_ready_i) busy <= 1'b0;
++		end
++	end
++
++endmodule
+diff --git a/rtl/vb_video_output.sv b/rtl/vb_video_output.sv
+index 44e8c74..7757c56 100644
+--- a/rtl/vb_video_output.sv
++++ b/rtl/vb_video_output.sv
+@@ -128,15 +128,22 @@ module vb_free_running_video
+ 	parameter [8:0]  COMPAT_V_SYNC_BEG      = 9'd243,
+ 	parameter [8:0]  COMPAT_V_SYNC_END      = 9'd246,
+ 	parameter [11:0] COMPAT_RAW_ACTIVE_CLOCKS = 12'd2540,
+-	parameter [11:0] COMPAT_RAW_LINE_LAST   = 12'd2541
++	parameter [11:0] COMPAT_RAW_LINE_LAST   = 12'd2541,
++	// 3D shutter-glasses raster: the compatibility raster shortened to 256 lines. One frame is then 16.27 ms (61.5 Hz)
++	// and a left+right pair 32.54 ms, below the 32.7 ms the Bluetooth glasses' 15-bit frame period counter allows.
++	parameter [8:0]  SHUTTER_V_TOTAL       = 9'd256,
++	parameter [8:0]  SHUTTER_V_SYNC_BEG    = 9'd237,
++	parameter [8:0]  SHUTTER_V_SYNC_END    = 9'd240
+ )
+ (
+ 	input  wire        clk_i,
+ 	input  wire        reset_i,
+ 	input  wire        side_by_side_req_i,
+ 	input  wire        compat_60hz_req_i,
++	input  wire        shutter_req_i,
+ 	output wire        side_by_side_o,
+ 	output wire        compat_60hz_o,
++	output wire        shutter_o,
+ 	output wire        pixel_ce_o,
+ 	output wire        source_timing_ce_o,
+ 	output wire [10:0] raster_x_o,
+@@ -151,6 +158,8 @@ module vb_free_running_video
+ 	reg side_by_side_q;
+ 	reg compat_60hz_q;
+ 	reg compat_60hz_pending_q;
++	reg shutter_q;
++	reg shutter_pending_q;
+ 	reg [11:0] raw_line_clock_q;
+ 	wire compat_60hz_requested_w = compat_60hz_req_i;
+ 
+@@ -168,11 +177,11 @@ module vb_free_running_video
+ 		COMPAT_NORMAL_H_TOTAL : NORMAL_H_TOTAL;
+ 	wire [10:0] sbs_h_total_w = compat_60hz_q ?
+ 		COMPAT_SBS_H_TOTAL : SBS_H_TOTAL;
+-	wire [8:0] v_total_w = compat_60hz_q ? COMPAT_V_TOTAL : V_TOTAL;
+-	wire [8:0] v_sync_beg_w = compat_60hz_q ?
+-		COMPAT_V_SYNC_BEG : V_SYNC_BEG;
+-	wire [8:0] v_sync_end_w = compat_60hz_q ?
+-		COMPAT_V_SYNC_END : V_SYNC_END;
++	wire [8:0] v_total_w = shutter_q ? SHUTTER_V_TOTAL : (compat_60hz_q ? COMPAT_V_TOTAL : V_TOTAL);
++	wire [8:0] v_sync_beg_w = shutter_q ? SHUTTER_V_SYNC_BEG : (compat_60hz_q ?
++		COMPAT_V_SYNC_BEG : V_SYNC_BEG);
++	wire [8:0] v_sync_end_w = shutter_q ? SHUTTER_V_SYNC_END : (compat_60hz_q ?
++		COMPAT_V_SYNC_END : V_SYNC_END);
+ 	wire [8:0] v_last_w = v_total_w - 9'd1;
+ 	wire long_line_w = (raster_y_o >= LONG_LINE_BEG) &&
+ 		(raster_y_o < LONG_LINE_END);
+@@ -196,6 +205,7 @@ module vb_free_running_video
+ 
+ 	assign side_by_side_o = side_by_side_q;
+ 	assign compat_60hz_o = compat_60hz_q;
++	assign shutter_o = shutter_q;
+ 	assign pixel_ce_o = !reset_i && active_raw_clock_w && public_sample_clock_w &&
+ 		(side_by_side_q ? sbs_pixel_phase_w : normal_pixel_phase_w);
+ 	assign source_timing_ce_o = !reset_i && active_raw_clock_w &&
+@@ -219,6 +229,8 @@ module vb_free_running_video
+ 			side_by_side_q <= 1'b0;
+ 			compat_60hz_q <= 1'b0;
+ 			compat_60hz_pending_q <= 1'b0;
++			shutter_q <= 1'b0;
++			shutter_pending_q <= 1'b0;
+ 			raw_line_clock_q <= 12'd0;
+ 			raster_y_o <= 9'd0;
+ 		end else begin
+@@ -226,6 +238,7 @@ module vb_free_running_video
+ 			// receives this committed selection on line zero of the new frame.
+ 			if (source_frame_terminal_w) begin
+ 				compat_60hz_pending_q <= compat_60hz_requested_w;
++				shutter_pending_q <= shutter_req_i;
+ 			end
+ 			if (raw_line_clock_q == raw_line_last_w) begin
+ 				raw_line_clock_q <= 12'd0;
+@@ -233,6 +246,7 @@ module vb_free_running_video
+ 					raster_y_o <= 9'd0;
+ 					side_by_side_q <= side_by_side_req_i;
+ 					compat_60hz_q <= compat_60hz_pending_q;
++					shutter_q <= shutter_pending_q;
+ 				end else begin
+ 					raster_y_o <= raster_y_o + 9'd1;
+ 				end
+@@ -341,6 +355,7 @@ module vb_video_output
+ 	input  wire        reset_i,
+ 	input  wire        side_by_side_req_i,
+ 	input  wire        compat_60hz_req_i,
++	input  wire        shutter_req_i,
+ 	input  wire        source_ce_i,
+ 	input  wire        source_present_i,
+ 	input  wire [7:0]  source_red_i,
+@@ -350,6 +365,7 @@ module vb_video_output
+ 	input  wire        source_vblank_i,
+ 	output wire        side_by_side_o,
+ 	output wire        compat_60hz_o,
++	output wire        shutter_o,
+ 	output wire        frame_wrap_o,
+ 	output wire        pixel_ce_o,
+ 	output wire        source_timing_ce_o,
+@@ -371,8 +387,10 @@ module vb_video_output
+ 		.reset_i(reset_i),
+ 		.side_by_side_req_i(side_by_side_req_i),
+ 		.compat_60hz_req_i(compat_60hz_req_i),
++		.shutter_req_i(shutter_req_i),
+ 		.side_by_side_o(side_by_side_o),
+ 		.compat_60hz_o(compat_60hz_o),
++		.shutter_o(shutter_o),
+ 		.pixel_ce_o(pixel_ce_o),
+ 		.source_timing_ce_o(source_timing_ce_o),
+ 		.raster_x_o(public_x_w),
+diff --git a/rtl/virtualboy.v b/rtl/virtualboy.v
+index b86565c..fbd9f4a 100644
+--- a/rtl/virtualboy.v
++++ b/rtl/virtualboy.v
+@@ -56,6 +56,7 @@ module virtualboy
+ 	input  wire         flat_dual_eye_i,
+ 	input  wire         side_by_side_i,
+ 	input  wire         compat_60hz_i,
++	input  wire         shutter_i,
+ 	input  wire [2:0]   parallax_scale_i,
+ 	input  wire         presentation_hlg_i,
+ 	input  wire         brightness_table_legacy_sdr_i,
+@@ -528,6 +529,7 @@ module virtualboy
+ 		.flat_dual_eye_i                 (flat_dual_eye_i),
+ 		.side_by_side_i                  (side_by_side_i),
+ 		.compat_60hz_i                   (compat_60hz_i),
++		.shutter_i                   (shutter_i),
+ 		.parallax_scale_i                (parallax_scale_i),
+ 		.presentation_hlg_i              (presentation_hlg_i),
+ 		.brightness_table_legacy_sdr_i   (brightness_table_legacy_sdr_i),

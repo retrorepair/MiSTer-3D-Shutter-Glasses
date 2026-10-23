@@ -1,0 +1,28 @@
+set_global_assignment -name SDC_FILE VirtualBoy.sdc
+# Read after VirtualBoy.sdc: sdram.sdc derives a generated clock from the
+# controller clock that derive_pll_clocks creates there.
+set_global_assignment -name SDC_FILE rtl/Mem/sdram.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE VirtualBoy.sv
+set_global_assignment -name QIP_FILE rtl/pll.qip
+set_global_assignment -name VERILOG_FILE rtl/Mem/cache_ram.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_ddr_channel_arbiter.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_tas_player.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_video_output.sv
+set_global_assignment -name VERILOG_FILE rtl/Mem/ddram.v
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_eyesync.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Mem/vb_cart_rom.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Mem/vb_cart_sdram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Mem/sdram.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Mem/vb_cart_ram_clear.sv
+set_global_assignment -name QIP_FILE rtl/NECv810/NECv810.qip
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/save_slot.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_cheat_loader.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/vb_cheat_engine.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Savestates/statemanager.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Savestates/savestates.sv
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/Savestates/savestate_ui.sv
+set_global_assignment -name VERILOG_FILE rtl/vue.v
+# Production uses the VIP implementation below.
+set_global_assignment -name QIP_FILE rtl/VIP/vip.qip
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/VSU/VSU.sv
+set_global_assignment -name VERILOG_FILE rtl/virtualboy.v

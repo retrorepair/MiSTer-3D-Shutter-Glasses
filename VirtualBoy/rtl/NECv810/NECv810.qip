@@ -1,0 +1,8 @@
+# Copyright (c) 2026 Jamie Blanks
+
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "NECv810.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "necv810_bus_engine.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "necv810_integer_engine.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "necv810_fp_engine.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "necv810_exception_entry.sv"]
+set_global_assignment -name SYSTEMVERILOG_FILE [file join $::quartus(qip_path) "necv810_regfile.sv"]
